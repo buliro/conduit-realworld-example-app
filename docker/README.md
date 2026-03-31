@@ -37,12 +37,14 @@
 
    ```bash
    mkdir -p secrets
+   cp secrets/postgres_password.txt.example secrets/postgres_password.txt
+   cp secrets/jwt_key.txt.example secrets/jwt_key.txt
    openssl rand -base64 48 > secrets/postgres_password.txt
    openssl rand -base64 64 > secrets/jwt_key.txt
    chmod 600 secrets/postgres_password.txt secrets/jwt_key.txt
    ```
 
-   This stack mounts those files as Docker secrets so the database password and JWT signing key are not passed as plain environment variables.
+   Template files are provided in `docker/secrets/*.example`. This stack mounts the real `.txt` files as Docker secrets so the database password and JWT signing key are not passed as plain environment variables.
 
 6. If you want local parity or need to smoke-test before public DNS is ready, set `SSL_MODE=self-signed` in `docker/.env`. That mode generates a self-signed certificate inside the shared certificate volume. Switch back to `SSL_MODE=letsencrypt` once DNS is live so Certbot can request a trusted certificate.
 7. Build and start the full stack:
@@ -71,6 +73,7 @@
 
 ## Security Notes
 
+- Docker builds use the repository root as their build context, and the repo-level `.dockerignore` excludes local secrets, `.env` files, `node_modules`, and other local artifacts from being sent to the Docker daemon.
 - Secrets are mounted from files instead of being injected directly as environment variables.
 - The database lives on an internal-only Docker network so the frontend cannot reach it directly.
 - `backend`, `frontend`, `certbot`, and `nginx` use `init: true`, `no-new-privileges`, and reduced writable paths.
