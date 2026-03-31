@@ -1,0 +1,248 @@
+name: conduit-app
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: conduit-db
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    tmpfs:
+      - /tmp
+    networks:
+      - db_net
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+    container_name: conduit-express-app
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      PROD_DB_USERNAME: ${POSTGRES_USER}
+      PROD_DB_NAME: ${POSTGRES_DB}
+      PROD_DB_HOSTNAME: db
+      PROD_DB_DIALECT: postgres
+      PROD_DB_LOGGING: ${PROD_DB_LOGGING}
+      JWT_KEY_FILE: /run/secrets/jwt_key
+      PROD_DB_PASSWORD_FILE: /run/secrets/postgres_password
+    command:
+      [
+        "/bin/sh",
+        "-ec",
+        "export JWT_KEY=\"$$(cat \"$$JWT_KEY_FILE\")\"; export PROD_DB_PASSWORD=\"$$(cat \"$$PROD_DB_PASSWORD_FILE\")\"; npm run migrate && exec node index.js",
+      ]
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    secrets:
+      - jwt_key
+      - postgres_password
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:3001/healthz', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - proxy_net
+      - db_net
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+    container_name: conduit-react-app
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/nginx:uid=101,gid=101,mode=0755
+      - /var/run:uid=101,gid=101,mode=0755
+      - /tmp:uid=101,gid=101,mode=1777
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--spider",
+          "--quiet",
+          "http://127.0.0.1:8080/healthz",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - proxy_net
+
+  certbot:
+    image: certbot/certbot:latest
+    init: true
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        LIVE_DIR="/etc/letsencrypt/live/${DOMAIN}"
+        mkdir -p "$${LIVE_DIR}" /var/www/certbot
+
+        if [ ! -f "$${LIVE_DIR}/fullchain.pem" ] || [ ! -f "$${LIVE_DIR}/privkey.pem" ]; then
+          if [ "${SSL_MODE}" = "self-signed" ]; then
+            openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+              -keyout "$${LIVE_DIR}/privkey.pem" \
+              -out "$${LIVE_DIR}/fullchain.pem" \
+              -subj "/CN=${DOMAIN}" \
+              -addext "subjectAltName = DNS:${DOMAIN}"
+          else
+            openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+              -keyout "$${LIVE_DIR}/privkey.pem" \
+              -out "$${LIVE_DIR}/fullchain.pem" \
+              -subj "/CN=${DOMAIN}" \
+              -addext "subjectAltName = DNS:${DOMAIN}"
+            certbot certonly --webroot -w /var/www/certbot \
+              --email "${CERTBOT_EMAIL}" \
+              --agree-tos \
+              --no-eff-email \
+              --rsa-key-size 4096 \
+              -d "${DOMAIN}" \
+              --non-interactive
+          fi
+        fi
+
+        trap exit TERM INT
+        while :; do
+          if [ "${SSL_MODE}" = "letsencrypt" ]; then
+            certbot renew --webroot -w /var/www/certbot --quiet
+          fi
+          sleep 12h & wait $${!}
+        done
+    env_file:
+      - ./.env
+    environment:
+      DOMAIN: ${DOMAIN}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL}
+      SSL_MODE: ${SSL_MODE}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    networks:
+      - proxy_net
+
+  nginx:
+    image: nginx:1.27-alpine
+    init: true
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until [ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" ]; do
+          sleep 2
+        done
+
+        (
+          while :; do
+            sleep 6h
+            nginx -s reload
+          done
+        ) &
+
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
+    env_file:
+      - ./.env
+    environment:
+      DOMAIN: ${DOMAIN}
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+      certbot:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /etc/nginx/conf.d
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    volumes:
+      - ./configs/nginx.conf:/etc/nginx/templates/default.conf.template:ro
+      - ./configs/ssl.conf:/etc/nginx/templates/ssl.conf.template:ro
+      - certbot_conf:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    networks:
+      - proxy_net
+
+volumes:
+  postgres_data:
+  certbot_conf:
+  certbot_www:
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:-./secrets/postgres_password.txt}
+  jwt_key:
+    file: ${JWT_KEY_FILE:-./secrets/jwt_key.txt}
+
+networks:
+  proxy_net:
+    driver: bridge
+  db_net:
+    driver: bridge
+    internal: true
