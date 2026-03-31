@@ -21,7 +21,7 @@
 3. Clone the repository onto the server and move into the Docker deployment folder:
 
    ```bash
-   git clone https://github.com/TonyMckes/conduit-realworld-example-app.git
+   git clone https://github.com/buliro/conduit-realworld-example-app.git
    cd conduit-realworld-example-app/docker
    ```
 
