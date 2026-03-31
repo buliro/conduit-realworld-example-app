@@ -36,6 +36,7 @@ dist
 .env.development.local
 .env.test.local
 .env.production.local
+docker/secrets/*.txt
 
 #log files
 npm-debug.log*
